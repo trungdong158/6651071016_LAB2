@@ -85,7 +85,7 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
           );
         }
       },
-      { rootMargin: '240px' },
+      { rootMargin: '400px 0px' },
     );
 
     observer.observe(sentinel);
@@ -252,9 +252,18 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
         )}
 
         {visibleCount < filteredJobs.length && (
-          <div ref={sentinelRef} className="flex flex-col items-center gap-3 py-8">
-            <p className="text-sm text-slate-500 dark:text-slate-400">
+          <div
+            ref={sentinelRef}
+            className="flex flex-col items-center gap-3 py-8"
+            data-testid="job-load-sentinel"
+          >
+            <p
+              className="text-sm text-slate-500 dark:text-slate-400"
+              role="status"
+              aria-live="polite"
+            >
               Đang hiển thị {visibleJobs.length} / {filteredJobs.length} việc làm
+              {' · '}Cuộn xuống để tự động tải thêm
             </p>
             <button
               type="button"
