@@ -1,10 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import jobsData from '../data/jobs.json';
+import { getJobBatch } from '../data/jobsRepository';
 import { JobCard } from '../components/JobCard';
 import type { Job } from '../types';
 
 const jobs: Job[] = jobsData;
-const pageSize = 6;
+const pageSize = 10;
 const categories = [...new Set(jobs.map((job) => job.category))].sort((a, b) =>
   a.localeCompare(b, 'vi'),
 );
@@ -26,8 +33,20 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
   const [location, setLocation] = useState('');
   const [jobType, setJobType] = useState('');
   const [sortOrder, setSortOrder] = useState('newest');
-  const [visibleCount, setVisibleCount] = useState(pageSize);
+  const [visibleJobs, setVisibleJobs] = useState<Job[]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [loadedCount, setLoadedCount] = useState(0);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const generationRef = useRef(0);
+  const inFlightRef = useRef<{ generation: number; cursor: number } | null>(
+    null,
+  );
+  const requestedCursorsRef = useRef(new Set<number>());
+  const loadedJobIdsRef = useRef(new Set<string>());
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const failedCursorRef = useRef(0);
   const filteredJobs = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase('vi');
     const results = jobs.filter((job) => {
@@ -56,22 +75,136 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
       return first.postedDaysAgo - second.postedDaysAgo;
     });
   }, [category, jobType, location, query, sortOrder]);
-  const visibleJobs = filteredJobs.slice(0, visibleCount);
   const hasFilters = Boolean(query || category || location || jobType);
+
+  const loadBatch = useCallback(
+    async (
+      cursor: number,
+      generation: number,
+      signal: AbortSignal,
+      isRetry = false,
+    ) => {
+      if (
+        generation !== generationRef.current ||
+        inFlightRef.current !== null ||
+        (!isRetry && requestedCursorsRef.current.has(cursor))
+      ) {
+        return;
+      }
+
+      inFlightRef.current = { generation, cursor };
+      requestedCursorsRef.current.add(cursor);
+      setIsLoading(true);
+      setLoadError(null);
+
+      try {
+        const batch = await getJobBatch(
+          filteredJobs,
+          cursor,
+          pageSize,
+          signal,
+        );
+        if (signal.aborted || generation !== generationRef.current) {
+          return;
+        }
+
+        if (batch.jobs.length === 0 && cursor > 0) {
+          setNextCursor(null);
+          setLoadedCount(loadedJobIdsRef.current.size);
+          return;
+        }
+
+        const newJobs = batch.jobs.filter((job) => {
+          if (loadedJobIdsRef.current.has(job.id)) {
+            return false;
+          }
+          loadedJobIdsRef.current.add(job.id);
+          return true;
+        });
+        if (batch.jobs.length > 0 && newJobs.length === 0) {
+          throw new Error('Batch không chứa công việc mới. Vui lòng thử lại.');
+        }
+
+        setVisibleJobs((currentJobs) => {
+          const currentIds = new Set(currentJobs.map((job) => job.id));
+          const uniqueJobs = newJobs.filter((job) => !currentIds.has(job.id));
+          return [...currentJobs, ...uniqueJobs];
+        });
+        setNextCursor(newJobs.length > 0 ? batch.nextCursor : null);
+        setLoadedCount(Math.min(loadedJobIdsRef.current.size, batch.total));
+      } catch (error) {
+        if (
+          !signal.aborted &&
+          generation === generationRef.current
+        ) {
+          failedCursorRef.current = cursor;
+          requestedCursorsRef.current.delete(cursor);
+          setLoadError(
+            error instanceof Error
+              ? error.message
+              : 'Đã xảy ra lỗi khi tải việc làm.',
+          );
+        }
+      } finally {
+        if (
+          inFlightRef.current?.generation === generation &&
+          inFlightRef.current.cursor === cursor
+        ) {
+          inFlightRef.current = null;
+          if (generation === generationRef.current) {
+            setIsLoading(false);
+          }
+        }
+      }
+    },
+    [filteredJobs],
+  );
+
+  useEffect(() => {
+    const generation = generationRef.current + 1;
+    generationRef.current = generation;
+    activeControllerRef.current?.abort();
+
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    inFlightRef.current = null;
+    requestedCursorsRef.current = new Set();
+    loadedJobIdsRef.current = new Set();
+    failedCursorRef.current = 0;
+    setVisibleJobs([]);
+    setNextCursor(null);
+    setLoadedCount(0);
+    setLoadError(null);
+
+    if (filteredJobs.length === 0) {
+      setIsLoading(false);
+      return () => controller.abort();
+    }
+
+    void loadBatch(0, generation, controller.signal);
+
+    return () => {
+      controller.abort();
+      if (activeControllerRef.current === controller) {
+        activeControllerRef.current = null;
+      }
+    }
+  }, [filteredJobs, loadBatch]);
 
   const clearFilters = () => {
     setQuery('');
     setCategory('');
     setLocation('');
     setJobType('');
-    setVisibleCount(pageSize);
   };
 
   useEffect(() => {
     const sentinel = sentinelRef.current;
     if (
       !sentinel ||
-      visibleCount >= filteredJobs.length ||
+      nextCursor === null ||
+      isLoading ||
+      loadError ||
       typeof IntersectionObserver === 'undefined'
     ) {
       return;
@@ -79,18 +212,20 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
 
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) {
-          setVisibleCount((count) =>
-            Math.min(count + pageSize, filteredJobs.length),
-          );
+        if (entries.some((entry) => entry.isIntersecting) && nextCursor !== null) {
+          const generation = generationRef.current;
+          const controller = activeControllerRef.current;
+          if (controller) {
+            void loadBatch(nextCursor, generation, controller.signal);
+          }
         }
       },
-      { rootMargin: '400px 0px' },
+      { rootMargin: '0px' },
     );
 
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [filteredJobs.length, visibleCount]);
+  }, [isLoading, loadBatch, loadError, nextCursor]);
 
   return (
     <main id="viec-lam" className="page-shell py-6 sm:py-10">
@@ -116,20 +251,14 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
             <input
               type="search"
               value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                setVisibleCount(pageSize);
-              }}
+              onChange={(event) => setQuery(event.target.value)}
               placeholder="Chức danh, kỹ năng hoặc công ty..."
               className="min-w-0 flex-1 border-0 bg-transparent py-2 text-base text-slate-900 outline-none placeholder:text-slate-500 focus:ring-0"
             />
             {query && (
               <button
                 type="button"
-                onClick={() => {
-                  setQuery('');
-                  setVisibleCount(pageSize);
-                }}
+                onClick={() => setQuery('')}
                 aria-label="Xóa từ khóa tìm kiếm"
                 className="grid h-9 w-9 shrink-0 place-items-center rounded-lg text-slate-500 hover:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-600"
               >
@@ -184,10 +313,7 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
               Ngành nghề
               <select
                 value={category}
-                onChange={(event) => {
-                  setCategory(event.target.value);
-                  setVisibleCount(pageSize);
-                }}
+                onChange={(event) => setCategory(event.target.value)}
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-600 dark:border-slate-700 dark:bg-slate-950 dark:text-white"
               >
                 <option value="">Tất cả ngành nghề</option>
@@ -198,10 +324,7 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
               Địa điểm
               <select
                 value={location}
-                onChange={(event) => {
-                  setLocation(event.target.value);
-                  setVisibleCount(pageSize);
-                }}
+                onChange={(event) => setLocation(event.target.value)}
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-600 dark:border-slate-700 dark:bg-slate-950 dark:text-white"
               >
                 <option value="">Tất cả địa điểm</option>
@@ -212,10 +335,7 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
               Hình thức làm việc
               <select
                 value={jobType}
-                onChange={(event) => {
-                  setJobType(event.target.value);
-                  setVisibleCount(pageSize);
-                }}
+                onChange={(event) => setJobType(event.target.value)}
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-medium text-slate-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-600 dark:border-slate-700 dark:bg-slate-950 dark:text-white"
               >
                 <option value="">Tất cả hình thức</option>
@@ -234,46 +354,92 @@ export function ListPage({ favorites, onToggleFavorite }: ListPageProps) {
           )}
         </div>
 
-        {visibleJobs.length > 0 ? (
-          <div className="grid grid-cols-1 gap-5 min-[640px]:grid-cols-2 min-[1025px]:grid-cols-3">
-            {visibleJobs.map((job) => (
-              <JobCard
-                key={job.id}
-                job={job}
-                isFavorite={favorites.includes(job.id)}
-                onToggleFavorite={onToggleFavorite}
-              />
-            ))}
-          </div>
-        ) : (
-          <p className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-600 dark:border-slate-700 dark:text-slate-300">
-            Không tìm thấy việc làm phù hợp. Hãy thử từ khóa khác.
-          </p>
-        )}
+        <div
+          id="job-batch"
+          aria-busy={isLoading}
+        >
+          {visibleJobs.length > 0 && (
+            <div className="grid grid-cols-1 gap-5 min-[640px]:grid-cols-2 min-[1025px]:grid-cols-3">
+              {visibleJobs.map((job) => (
+                <JobCard
+                  key={job.id}
+                  job={job}
+                  isFavorite={favorites.includes(job.id)}
+                  onToggleFavorite={onToggleFavorite}
+                />
+              ))}
+            </div>
+          )}
 
-        {visibleCount < filteredJobs.length && (
-          <div
-            ref={sentinelRef}
-            className="flex flex-col items-center gap-3 py-8"
-            data-testid="job-load-sentinel"
-          >
-            <p
-              className="text-sm text-slate-500 dark:text-slate-400"
+          {isLoading && (
+            <div
+              className="flex items-center justify-center gap-3 py-8 text-sm text-slate-600 dark:text-slate-300"
               role="status"
               aria-live="polite"
             >
-              Đang hiển thị {visibleJobs.length} / {filteredJobs.length} việc làm
-              {' · '}Cuộn xuống để tự động tải thêm
-            </p>
-            <button
-              type="button"
-              onClick={() => setVisibleCount((count) => Math.min(count + pageSize, filteredJobs.length))}
-              className="rounded-xl border border-slate-300 bg-white px-5 py-2.5 text-sm font-bold text-slate-800 transition-colors hover:border-brand-600 hover:text-brand-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand-600 dark:border-slate-700 dark:bg-slate-900 dark:text-white dark:hover:text-brand-100"
+              <span
+                aria-hidden="true"
+                className="h-5 w-5 animate-spin rounded-full border-2 border-brand-200 border-t-brand-700"
+              />
+              {visibleJobs.length > 0
+                ? 'Đang tải nhóm việc làm tiếp theo...'
+                : 'Đang tải việc làm...'}
+            </div>
+          )}
+
+          {loadError && (
+            <div
+              className="my-6 rounded-2xl border border-rose-200 bg-rose-50 p-5 text-center dark:border-rose-900 dark:bg-rose-950"
+              role="alert"
             >
-              Xem thêm việc làm
-            </button>
-          </div>
-        )}
+              <p className="font-semibold text-rose-800 dark:text-rose-200">
+                Không thể tải việc làm. {loadError}
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  const controller = activeControllerRef.current;
+                  if (controller) {
+                    void loadBatch(
+                      failedCursorRef.current,
+                      generationRef.current,
+                      controller.signal,
+                      true,
+                    );
+                  }
+                }}
+                className="mt-3 rounded-lg border border-rose-300 bg-white px-4 py-2 text-sm font-bold text-rose-800 hover:bg-rose-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-rose-700 dark:border-rose-800 dark:bg-slate-900 dark:text-rose-200"
+              >
+                Thử tải lại
+              </button>
+            </div>
+          )}
+
+          {!isLoading && !loadError && visibleJobs.length === 0 && (
+            <p className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-600 dark:border-slate-700 dark:text-slate-300">
+              Không tìm thấy việc làm phù hợp. Hãy thử từ khóa khác.
+            </p>
+          )}
+
+          {!loadError && nextCursor !== null && (
+            <div
+              ref={sentinelRef}
+              className="flex min-h-20 items-center justify-center py-8"
+              data-testid="job-load-sentinel"
+              aria-hidden="true"
+            />
+          )}
+
+          {!isLoading && !loadError && loadedCount > 0 && nextCursor === null && (
+            <p
+              className="py-8 text-center text-sm text-slate-500 dark:text-slate-400"
+              role="status"
+              aria-live="polite"
+            >
+              Bạn đã xem hết {loadedCount} việc làm phù hợp.
+            </p>
+          )}
+        </div>
       </section>
     </main>
   );
